@@ -1,0 +1,46 @@
+name: tomselleck
+
+services:
+  git:
+    image: gitea/gitea:latest-rootless
+    container_name: tom-git
+    network_mode: bridge
+    ports:
+      - "0.0.0.0:8099:8099"
+    volumes:
+      - git-data:/var/lib/gitea
+      - git-config:/etc/gitea
+    environment:
+      - GITEA__server__HTTP_PORT=8099
+      - GITEA__server__ROOT_URL=http://localhost:8099/
+      - GITEA__server__DISABLE_SSH=true
+      - GITEA__database__DB_TYPE=sqlite3
+      - GITEA__service__DISABLE_REGISTRATION=true
+      - GITEA__service__REQUIRE_SIGNIN_VIEW=true
+      - GITEA__repository__DEFAULT_PRIVATE=true
+      - GITEA__repository__ENABLE_PUSH_CREATE_USER=true
+      - GITEA__repository__ENABLE_PUSH_CREATE_ORG=true
+      - GITEA__security__INSTALL_LOCK=true
+      - GITEA__security__MIN_PASSWORD_LENGTH=5
+      - GITEA__server__LFS_START_SERVER=false
+    restart: unless-stopped
+
+  # Docker Hub pull-through cache for the devcontainer's inner Docker
+  # (start-dockerd.sh points it here; the firewall allows only this port on the host).
+  # Bound to the Docker bridge so containers can reach it but the LAN can't.
+  registry-cache:
+    image: registry:3
+    container_name: tom-registry-cache
+    network_mode: bridge
+    ports:
+      - "172.17.0.1:5000:5000"
+    volumes:
+      - registry-cache:/var/lib/registry
+    environment:
+      - REGISTRY_PROXY_REMOTEURL=https://registry-1.docker.io
+    restart: unless-stopped
+
+volumes:
+  git-data:
+  git-config:
+  registry-cache:

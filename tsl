@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# tsl — run Claude Code inside this folder's devcontainer, with Gitea alongside.
+#
+#   ./tsl [claude args...]   resume the "TomSelleckLite" session (or create it), with Remote Control on
+#   ./tsl new [claude args]  start a fresh "TomSelleckLite" session even if one exists
+#   ./tsl shell              open a shell in the container
+#   ./tsl stop               stop the container and Gitea
+#   ./tsl rebuild            rebuild the container (login and sessions are kept)
+#   ./tsl help               show this help
+#
+# Override the session name with TSL_NAME=OtherName ./tsl
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$DIR"
+
+NAME="${TSL_NAME:-TomSelleckLite}"
+
+die() { printf '\033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
+
+if [[ ${1:-} == help ]]; then
+  sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+fi
+
+[[ -d .devcontainer ]] || die "No .devcontainer here. Run ./init first."
+command -v devcontainer >/dev/null || die "devcontainer CLI missing (npm install -g @devcontainers/cli)"
+
+container_id() {
+  docker ps -aq --filter "label=devcontainer.local_folder=$DIR" | head -n1
+}
+
+in_container() {
+  devcontainer exec --workspace-folder "$DIR" "$@"
+}
+
+ensure_gitea() {
+  [[ -f "$DIR/gitea" ]] || die "gitea script missing in $DIR"
+  bash "$DIR/gitea" up || die "Gitea did not start (./gitea logs)"
+}
+
+ensure_firewall() {
+  # example.com is not on the allowlist, so reaching it means the firewall is down
+  if in_container curl -s --max-time 3 -o /dev/null https://example.com 2>/dev/null; then
+    echo "Firewall not active, applying..."
+    in_container sudo /usr/local/bin/init-firewall.sh >/dev/null
+    # The firewall flushes Docker's iptables rules; restarting dockerd restores them
+    in_container sudo /usr/local/bin/start-dockerd.sh
+  fi
+}
+
+# The container runs its own Docker daemon, which needs the Sysbox runtime on the host
+require_sysbox() {
+  docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -q '"sysbox-runc"' \
+    || die "Sysbox runtime not installed on the host (https://github.com/nestybox/sysbox/releases)"
+}
+
+ensure_up() {
+  require_sysbox
+  ensure_gitea
+  local id
+  id="$(container_id)"
+  if [[ -z $id ]] || [[ "$(docker inspect -f '{{.State.Running}}' "$id")" != true ]]; then
+    echo "Starting container..."
+    devcontainer up --workspace-folder "$DIR" >/dev/null
+  fi
+  ensure_firewall
+}
+
+# Prints the ID of the most recent session named $NAME, or nothing.
+# Claude Code records names in the transcript as {"type":"custom-title","customTitle":"<name>",...}
+find_session() {
+  in_container bash -c '
+    dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects"
+    [ -d "$dir" ] || exit 0
+    grep -rlF --include="*.jsonl" "\"customTitle\":\"$1\"" "$dir" 2>/dev/null \
+      | xargs -r ls -t 2>/dev/null | head -n1 | xargs -r basename -s .jsonl
+  ' _ "$NAME" 2>/dev/null | tail -n1 || true
+}
+
+start_claude() {
+  local fresh=$1; shift
+  ensure_up
+  local sid=""
+  [[ $fresh == no ]] && sid="$(find_session)"
+  if [[ $sid =~ ^[0-9a-f-]{36}$ ]]; then
+    echo "Resuming $NAME ($sid) with Remote Control"
+    exec devcontainer exec --workspace-folder "$DIR" \
+      claude --resume "$sid" --remote-control "$NAME" "$@"
+  else
+    echo "Starting new session $NAME with Remote Control"
+    exec devcontainer exec --workspace-folder "$DIR" \
+      claude --name "$NAME" --remote-control "$NAME" "$@"
+  fi
+}
+
+case "${1:-}" in
+  new)
+    shift
+    start_claude yes "$@"
+    ;;
+  shell)
+    ensure_up
+    exec devcontainer exec --workspace-folder "$DIR" zsh
+    ;;
+  stop)
+    id="$(container_id)"
+    if [[ -n $id ]]; then docker stop "$id" >/dev/null; echo "Container stopped."; else echo "Container not running."; fi
+    if [[ -f "$DIR/gitea" ]]; then bash "$DIR/gitea" stop >/dev/null 2>&1 && echo "Gitea stopped."; fi
+    ;;
+  rebuild)
+    require_sysbox
+    ensure_gitea
+    exec devcontainer up --workspace-folder "$DIR" --remove-existing-container
+    ;;
+  *)
+    start_claude no "$@"
+    ;;
+esac

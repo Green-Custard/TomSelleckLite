@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# gitea-onboard — create the Gitea users and org. Runs on the host; safe to re-run.
+#
+#   ./gitea-onboard              create whatever is missing (asks for the host password)
+#   ./gitea-onboard reset-host   set a new password for host
+#
+#   host      admin; you choose the password, it is never stored
+#   agent     password "agent", not an admin; this is the sandboxed agent's account
+#   host-org  private org owned by host; agent has no access
+#
+# ./gitea up calls this whenever agent:agent can't log in.
+# Set HOST_PASS to skip the prompt (e.g. when no terminal is attached).
+set -euo pipefail
+
+CONTAINER=tom-git
+GITEA_URL="${GITEA_URL:-http://localhost:8099}"
+MIN_LEN=8
+
+say() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+die() { printf '\033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
+
+command -v docker >/dev/null || die "docker not found; run ./gitea-onboard on the host, not inside the container"
+[[ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" == true ]] || die "$CONTAINER is not running (./gitea up)"
+
+for _ in $(seq 30); do
+  curl -sf -m 2 -o /dev/null "$GITEA_URL/api/healthz" && break
+  sleep 1
+done
+curl -sf -m 2 -o /dev/null "$GITEA_URL/api/healthz" || die "Gitea is not answering at $GITEA_URL"
+
+gitea_cli() { docker exec "$CONTAINER" gitea "$@"; }
+user_exists() { gitea_cli admin user list | awk 'NR > 1 { print $2 }' | grep -qx "$1"; }
+
+# curl with host's credentials passed via a config file descriptor, so the password
+# doesn't show up in the process list
+api() {
+  local p=${HOST_PASS//\\/\\\\}; p=${p//\"/\\\"}
+  curl -sf -K <(printf 'user = "host:%s"\n' "$p") -H 'Content-Type: application/json' "$@"
+}
+host_login_ok() { api -o /dev/null "$GITEA_URL/api/v1/user"; }
+
+have_tty() { { : </dev/tty; } 2>/dev/null; }
+
+# ask_password <prompt> [confirm]
+ask_password() {
+  have_tty || die "no terminal to ask for the host password; set HOST_PASS"
+  local p1 p2
+  while true; do
+    read -rsp "$1: " p1 </dev/tty; echo >/dev/tty
+    if [[ ${2:-} == confirm ]]; then
+      if ((${#p1} < MIN_LEN)); then echo "    At least $MIN_LEN characters, please." >/dev/tty; continue; fi
+      read -rsp "Repeat it: " p2 </dev/tty; echo >/dev/tty
+      [[ $p1 == "$p2" ]] || { echo "    They don't match, try again." >/dev/tty; continue; }
+    fi
+    HOST_PASS=$p1
+    return
+  done
+}
+
+set_host_password() {
+  gitea_cli admin user change-password --username host --password "$HOST_PASS" --must-change-password=false >/dev/null
+}
+
+if [[ ${1:-} == reset-host ]]; then
+  user_exists host || die "host doesn't exist yet; run ./gitea-onboard"
+  [[ -n ${HOST_PASS:-} ]] || ask_password "New Gitea password for host" confirm
+  set_host_password
+  host_login_ok || die "host still can't log in"
+  say "host password changed"
+  exit 0
+fi
+
+say "Setting up users"
+if ! user_exists host; then
+  [[ -n ${HOST_PASS:-} ]] || ask_password "Choose a Gitea password for the admin user host" confirm
+  gitea_cli admin user create --username host --password "$HOST_PASS" --email host@local \
+    --admin --must-change-password=false >/dev/null
+  echo "    Created admin user host"
+else
+  echo "    host user already exists"
+  [[ -n ${HOST_PASS:-} ]] || ask_password "Gitea password for host"
+fi
+
+host_login_ok || die "can't log in as host with that password (forgotten it? ./gitea-onboard reset-host)"
+
+if ! user_exists agent; then
+  gitea_cli admin user create --username agent --password agent --email agent@local \
+    --must-change-password=false >/dev/null
+  echo "    Created user agent/agent (non-admin)"
+else
+  # Make sure the agent's password is "agent" and it is not an admin
+  if ! curl -sf -o /dev/null -u agent:agent "$GITEA_URL/api/v1/user"; then
+    gitea_cli admin user change-password --username agent --password agent --must-change-password=false >/dev/null
+    echo "    Reset agent's password to agent"
+  fi
+  api -o /dev/null -X PATCH "$GITEA_URL/api/v1/admin/users/agent" \
+    -d '{"login_name":"agent","source_id":0,"admin":false}'
+  echo "    agent user already exists (ensured non-admin)"
+fi
+
+curl -sf -o /dev/null -u agent:agent "$GITEA_URL/api/v1/user" || die "agent:agent still can't log in"
+
+say "Setting up host-org (private, agent has no access)"
+if ! api -o /dev/null "$GITEA_URL/api/v1/orgs/host-org"; then
+  api -o /dev/null -X POST "$GITEA_URL/api/v1/orgs" \
+    -d '{"username":"host-org","visibility":"private","repo_admin_change_team_access":false}'
+  echo "    Created private org host-org"
+else
+  echo "    host-org already exists"
+fi
+
+say "Done. Log in at $GITEA_URL as host or agent/agent"

@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# gitea — manage the Gitea container and the Docker Hub cache (compose.gitea.yml). Runs on the host.
+#
+#   ./gitea [up]    start Gitea (default; no-op if already running)
+#   ./gitea stop    stop it
+#   ./gitea logs    follow its logs
+#   ./gitea status  show its state
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMPOSE=(docker compose -f "$DIR/compose.gitea.yml")
+
+die() { printf '\033[1;31mxx\033[0m %s\n' "$*" >&2; exit 1; }
+
+command -v docker >/dev/null || die "docker not found; run ./gitea on the host, not inside the container"
+[[ -f "$DIR/compose.gitea.yml" ]] || die "compose.gitea.yml missing in $DIR"
+
+case "${1:-up}" in
+  up)
+    if ! out="$("${COMPOSE[@]}" up -d 2>&1)"; then
+      printf '%s\n' "$out" >&2
+      die "Gitea failed to start"
+    fi
+    # Wait until it answers, then onboard if the agent account can't log in
+    for _ in $(seq 30); do
+      curl -sf -m 2 -o /dev/null http://localhost:8099/api/healthz && break
+      sleep 1
+    done
+    if ! curl -sf -m 5 -o /dev/null -u agent:agent http://localhost:8099/api/v1/user; then
+      echo "Gitea user agent:agent not found, onboarding..."
+      bash "$DIR/gitea-onboard"
+    fi
+    ;;
+  stop)   "${COMPOSE[@]}" stop ;;
+  logs)   exec "${COMPOSE[@]}" logs -f ;;
+  status) "${COMPOSE[@]}" ps ;;
+  *)      sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac
